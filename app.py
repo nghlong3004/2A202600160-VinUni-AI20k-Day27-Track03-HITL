@@ -23,11 +23,17 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
 from common.db import db_path
-# TODO: import the graph builder + helpers from your exercise 4 solution.
-# Suggestion: rename `exercises/exercise_4_audit.py` functions you need
-# (build_graph, handle_interrupt logic) and import them here, OR copy the
-# graph wiring inline.
-# from exercises.exercise_4_audit import build_graph
+from exercises.exercise_4_audit import (
+    node_fetch_pr, node_analyze, node_route,
+    node_auto_approve, node_human_approval,
+    node_commit, node_escalate, node_synthesize,
+    audit, AGENT_ID
+)
+from langgraph.graph import START, END, StateGraph
+from common.schemas import ReviewState, PRAnalysis, risk_level_for, AuditEntry
+from common.llm import get_llm
+from common.db import db_conn
+import time
 
 
 load_dotenv()
@@ -52,10 +58,59 @@ st.title("HITL PR Review Agent")
 # ─── Sidebar — recent sessions ─────────────────────────────────────────────
 with st.sidebar:
     st.header("Recent sessions")
-    # TODO: call `audit.replay.list_threads`-style query against audit_events
-    # and render thread_id + pr_url + worst_risk + last_event as a small table.
-    # On row click, set st.session_state.thread_id and rerun.
-    st.caption("(TODO — populate from audit_events)")
+    async def fetch_recent_sessions():
+        async with db_conn() as conn:
+            async with conn.execute(
+                """
+                SELECT thread_id, pr_url, 
+                       MIN(timestamp) AS started, MAX(timestamp) AS last_event,
+                       MAX(risk_level) AS worst_risk, COUNT(*) AS events
+                FROM audit_events
+                GROUP BY thread_id, pr_url
+                ORDER BY MAX(timestamp) DESC LIMIT 25
+                """
+            ) as cur:
+                return await cur.fetchall()
+                
+    recent_sessions = asyncio.run(fetch_recent_sessions())
+    for r in recent_sessions:
+        if st.button(f"{r['thread_id'][:8]} - {r['worst_risk']} ({r['events']} events)", key=f"btn_{r['thread_id']}"):
+            st.session_state.thread_id = r['thread_id']
+            st.session_state.pr_url = r['pr_url']
+            st.session_state.interrupt_payload = None
+            st.session_state.final = None
+            st.rerun()
+            
+    st.header("Metrics (Bonus 2)")
+    async def fetch_metrics():
+        async with db_conn() as conn:
+            async with conn.execute(
+                "SELECT AVG(confidence) as avg_conf, COUNT(*) as approvals FROM audit_events WHERE decision = 'approve'"
+            ) as cur:
+                return await cur.fetchone()
+    
+    metrics = asyncio.run(fetch_metrics())
+    if metrics:
+        st.metric("Avg Confidence of Approved", f"{metrics['avg_conf'] or 0:.2%}")
+        st.metric("Total Approvals", metrics['approvals'] or 0)
+
+    st.header("Time Travel (Bonus 1)")
+    if st.session_state.thread_id:
+        async def fetch_history():
+            async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
+                cfg = {"configurable": {"thread_id": st.session_state.thread_id}}
+                history = [s async for s in cp.aget_state_history(cfg)]
+                return history
+        
+        try:
+            history = asyncio.run(fetch_history())
+            if history:
+                options = {s.config['configurable']['checkpoint_id']: f"Checkpoint at step {len(history)-i}" for i, s in enumerate(history)}
+                selected_checkpoint = st.selectbox("Select checkpoint to view/resume", options=list(options.keys()), format_func=lambda x: options[x])
+                if st.button("Resume from checkpoint"):
+                    st.write(f"Checkpoint {selected_checkpoint} selected. (Graph resume logic can be tied to this config)")
+        except Exception as e:
+            st.error("Could not fetch history")
 
 
 # ─── Top form — start a new review ─────────────────────────────────────────
@@ -83,16 +138,12 @@ def render_approval_card(payload: dict) -> dict | None:
 
     feedback = st.text_input("Feedback (optional)", key="approval_feedback")
     col1, col2, col3 = st.columns(3)
-    # TODO: hook up the three buttons. Each click should return one of:
-    #   {"choice": "approve", "feedback": feedback}
-    #   {"choice": "reject",  "feedback": feedback}
-    #   {"choice": "edit",    "feedback": feedback}
     if col1.button("Approve", type="primary"):
-        ...  # return {"choice": "approve", ...}
+        return {"choice": "approve", "feedback": feedback}
     if col2.button("Reject"):
-        ...
+        return {"choice": "reject", "feedback": feedback}
     if col3.button("Edit"):
-        ...
+        return {"choice": "edit", "feedback": feedback}
     return None
 
 
@@ -106,11 +157,12 @@ def render_escalation_card(payload: dict) -> dict | None:
     st.markdown(payload["summary"])
 
     with st.form("escalation"):
-        # TODO: render one text_input per question in payload["questions"]
-        #       collect answers into a dict {question: answer_str}
-        #       on submit, return the dict.
         answers: dict[str, str] = {}
-        st.form_submit_button("Submit answers")
+        for q in payload.get("questions", []):
+            answers[q] = st.text_input(f"Q: {q}", key=f"q_{q}")
+        submitted = st.form_submit_button("Submit answers")
+        if submitted:
+            return answers
     return None
 
 
@@ -119,18 +171,62 @@ async def run_graph(pr_url: str, thread_id: str, resume_value=None):
     """Invoke the graph once. Returns the final result or {'__interrupt__': ...}."""
     async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
         await cp.setup()
-        # TODO: build the graph with `cp` as the checkpointer (use the function
-        # you imported/copied at the top of this file).
-        # app = build_graph(cp)
+        async def node_auto_edit(state):
+            t0 = time.monotonic()
+            feedback = state.get("human_feedback")
+            llm = get_llm().with_structured_output(PRAnalysis)
+            with st.spinner("LLM rewriting review based on human feedback..."):
+                refined = await llm.ainvoke([
+                    {"role": "system", "content": "Refine review based on human feedback."},
+                    {"role": "user", "content": f"Original Analysis Summary: {state['analysis'].summary}\nFeedback: {feedback}"}
+                ])
+            await audit(state, AuditEntry(
+                agent_id=AGENT_ID,
+                action="auto_edit",
+                confidence=refined.confidence,
+                risk_level=risk_level_for(refined.confidence),
+                decision="pending",
+                reason=f"Rewritten with feedback: {feedback}",
+                execution_time_ms=int((time.monotonic() - t0) * 1000),
+            ))
+            return {"analysis": refined, "human_choice": "approve"}
+            
+        g = StateGraph(ReviewState)
+        for name, fn in [
+            ("fetch_pr", node_fetch_pr), ("analyze", node_analyze), ("route", node_route),
+            ("auto_approve", node_auto_approve), ("human_approval", node_human_approval),
+            ("commit", node_commit), ("escalate", node_escalate), ("synthesize", node_synthesize),
+        ]:
+            g.add_node(name, fn)
+        g.add_node("auto_edit", node_auto_edit)
+        g.add_edge(START, "fetch_pr")
+        g.add_edge("fetch_pr", "analyze")
+        g.add_edge("analyze", "route")
+        g.add_conditional_edges(
+            "route", lambda s: s["decision"],
+            {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"},
+        )
+        g.add_edge("auto_approve", END)
+        
+        def human_approval_edge(state):
+            if state.get("human_choice") == "edit":
+                return "auto_edit"
+            return "commit"
+        g.add_conditional_edges("human_approval", human_approval_edge, {"auto_edit": "auto_edit", "commit": "commit"})
+        
+        g.add_edge("auto_edit", "commit")
+        g.add_edge("commit", END)
+        g.add_edge("escalate", "synthesize")
+        g.add_edge("synthesize", "commit")
+        
+        app = g.compile(checkpointer=cp)
         cfg = {"configurable": {"thread_id": thread_id}}
 
-        # TODO:
-        # - If resume_value is None: result = await app.ainvoke(
-        #       {"pr_url": pr_url, "thread_id": thread_id}, cfg)
-        # - Else:                    result = await app.ainvoke(
-        #       Command(resume=resume_value), cfg)
-        # - Return result.
-        raise NotImplementedError("Wire up the graph invocation")
+        if resume_value is None:
+            result = await app.ainvoke({"pr_url": pr_url, "thread_id": thread_id}, cfg)
+        else:
+            result = await app.ainvoke(Command(resume=resume_value), cfg)
+        return result
 
 
 # ─── Main flow ─────────────────────────────────────────────────────────────
